@@ -40,14 +40,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--request-concurrency",
         type=int,
-        default=40,
+        default=8,
         help="Maximum concurrent HTTP requests.",
     )
     parser.add_argument(
         "--category-concurrency",
         type=int,
-        default=8,
+        default=2,
         help="Maximum categories processed concurrently.",
+    )
+    parser.add_argument(
+        "--page-batch-size",
+        type=int,
+        default=12,
+        help="How many pages per category to schedule at once.",
+    )
+    parser.add_argument(
+        "--request-delay-ms",
+        type=int,
+        default=120,
+        help="Random delay (0..N ms) before each request to reduce rate limiting.",
     )
     parser.add_argument(
         "--max-retries",
@@ -86,12 +98,16 @@ class Scraper:
         request_concurrency: int,
         category_concurrency: int,
         max_retries: int,
+        page_batch_size: int,
+        request_delay_ms: int,
     ) -> None:
         self.session = session
         self.build_id = build_id
         self.request_semaphore = asyncio.Semaphore(request_concurrency)
         self.category_semaphore = asyncio.Semaphore(category_concurrency)
         self.max_retries = max_retries
+        self.page_batch_size = max(1, page_batch_size)
+        self.request_delay_ms = max(0, request_delay_ms)
         self.rows: List[Dict[str, Any]] = []
         self._rows_lock = asyncio.Lock()
 
@@ -115,10 +131,12 @@ class Scraper:
         for attempt in range(1, self.max_retries + 1):
             try:
                 async with self.request_semaphore:
+                    if self.request_delay_ms:
+                        await asyncio.sleep(random.uniform(0, self.request_delay_ms / 1000.0))
                     async with self.session.get(
                         url, params=params, headers=self.headers
                     ) as resp:
-                        if resp.status in (429, 500, 502, 503, 504):
+                        if resp.status in (403, 429, 500, 502, 503, 504):
                             wait = min(10.0, 0.7 * (2 ** (attempt - 1))) + random.random()
                             await asyncio.sleep(wait)
                             continue
@@ -206,19 +224,24 @@ class Scraper:
             ]
 
             if total_pages > 1:
-                tasks = [
-                    asyncio.create_task(self.fetch_json(category_id, page))
-                    for page in range(2, total_pages + 1)
-                ]
-                for page, task in enumerate(tasks, start=2):
-                    payload = await task
-                    if not payload:
-                        continue
-                    page_data = self._extract_page_data(payload)
-                    if not page_data:
-                        continue
-                    for bu in page_data["businesses"]:
-                        category_rows.append(self._business_to_row(category_id, page, total_pages, bu))
+                pages = list(range(2, total_pages + 1))
+                for i in range(0, len(pages), self.page_batch_size):
+                    batch_pages = pages[i : i + self.page_batch_size]
+                    tasks = {
+                        page: asyncio.create_task(self.fetch_json(category_id, page))
+                        for page in batch_pages
+                    }
+                    for page, task in tasks.items():
+                        payload = await task
+                        if not payload:
+                            continue
+                        page_data = self._extract_page_data(payload)
+                        if not page_data:
+                            continue
+                        for bu in page_data["businesses"]:
+                            category_rows.append(
+                                self._business_to_row(category_id, page, total_pages, bu)
+                            )
 
             async with self._rows_lock:
                 self.rows.extend(category_rows)
@@ -296,6 +319,8 @@ async def async_main(args: argparse.Namespace) -> None:
             request_concurrency=args.request_concurrency,
             category_concurrency=args.category_concurrency,
             max_retries=args.max_retries,
+            page_batch_size=args.page_batch_size,
+            request_delay_ms=args.request_delay_ms,
         )
         rows = await scraper.scrape_all(category_ids)
         write_csv(args.output, rows)
